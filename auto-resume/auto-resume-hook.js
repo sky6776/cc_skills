@@ -24,7 +24,10 @@ const DEFAULT_CONFIG = {
 function log(msg) {
   const ts = new Date().toISOString();
   const line = `[${ts}] ${msg}\n`;
-  try { fs.appendFileSync(LOG_FILE, line); } catch {}
+  try {
+    fs.mkdirSync(BASE_DIR, { recursive: true });
+    fs.appendFileSync(LOG_FILE, line);
+  } catch {}
 }
 
 function loadConfig() {
@@ -53,9 +56,28 @@ function saveState(state) {
 }
 
 async function main() {
-  log('StopFailure hook triggered');
+  // Log everything we receive from the hook system
+  log('=== StopFailure hook triggered ===');
+  log(`argv: ${JSON.stringify(process.argv)}`);
+  log(`env keys: CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR || '(unset)'}`);
+
+  // Read stdin (Claude Code may pass error details via stdin)
+  let stdinData = '';
+  try {
+    if (!process.stdin.isTTY) {
+      process.stdin.setEncoding('utf8');
+      for await (const chunk of process.stdin) {
+        stdinData += chunk;
+      }
+    }
+  } catch {}
+  if (stdinData) {
+    log(`stdin: ${stdinData.substring(0, 500)}`);
+  }
 
   const state = loadState();
+  log(`state: enabled=${state.enabled}, retryCount=${state.retryCount}, lastResumeAt=${state.lastResumeAt}`);
+
   if (!state.enabled) {
     log('Auto-resume is disabled, skipping');
     return;
@@ -63,13 +85,11 @@ async function main() {
 
   const config = loadConfig();
 
-  // Check max retries
   if (state.retryCount >= config.maxRetries) {
     log(`Max retries (${config.maxRetries}) reached, skipping`);
     return;
   }
 
-  // Check cooldown
   if (state.lastResumeAt) {
     const elapsed = (Date.now() - state.lastResumeAt) / 1000;
     if (elapsed < config.retryCooldownSeconds) {
@@ -79,14 +99,12 @@ async function main() {
     }
   }
 
-  // Update state
   state.retryCount += 1;
   state.lastResumeAt = Date.now();
   saveState(state);
 
   log(`Scheduling resume in ${config.delaySeconds}s (retry ${state.retryCount}/${config.maxRetries})`);
 
-  // Spawn background process that sleeps then injects
   const scriptDir = __dirname;
   const injectScript = path.join(scriptDir, 'inject-input.js');
 
@@ -102,7 +120,7 @@ async function main() {
   });
 
   child.unref();
-  log('Background injector spawned');
+  log(`Background injector spawned (pid=${child.pid})`);
 }
 
 main().catch(e => log(`Error: ${e.message}`));

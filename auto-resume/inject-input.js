@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// inject-input.js — Inject keyboard input into Claude Code's terminal
+// auto-resume inject-input.js — Inject keyboard input into Claude Code's terminal
 // Called as a detached background process by auto-resume-hook.js
+// Input comes from user's own config.json, not external input — execSync is safe here.
 //
 // Environment variables:
 //   AUTO_RESUME_DELAY  - seconds to wait before injecting (default: 30)
@@ -27,70 +28,66 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Windows: inject input into the cmd terminal running Claude Code
-// Strategy: Use clipboard + SendKeys for reliable text injection in cmd
-// SendKeys cannot handle Chinese characters, so we:
-//   1. Copy the prompt text to clipboard
-//   2. Send Ctrl+V to paste it
-//   3. Send Enter to submit
+// ── Windows ──────────────────────────────────────────────────────────
+// Clipboard + SendKeys. SendKeys can't handle CJK, so we paste instead.
 function injectWindows(text) {
   const tmpScript = path.join(require('os').tmpdir(), `auto-resume-${Date.now()}.ps1`);
-
-  // Escape for PowerShell string
   const escapedText = text.replace(/'/g, "''");
 
   const psContent = `
     Add-Type -AssemblyName System.Windows.Forms
 
-    # Copy prompt to clipboard
     [System.Windows.Forms.Clipboard]::SetText('${escapedText}')
-
     Start-Sleep -Milliseconds 500
 
-    # Find the Claude Code terminal window
-    # Works with cmd, Windows Terminal, and conhost
     $shell = New-Object -ComObject WScript.Shell
+    $found = $false
 
-    # Look for cmd or terminal process with claude in title
-    $procs = Get-Process -Name cmd -ErrorAction SilentlyContinue
-    $wt = Get-Process -Name WindowsTerminal,WindowTerminal -ErrorAction SilentlyContinue
-    $ch = Get-Process -Name conhost -ErrorAction SilentlyContinue
+    # Priority 1: Any window with "claude" in title
+    $allProcs = Get-Process | Where-Object { $_.MainWindowTitle -match 'claude' -and $_.MainWindowTitle -ne '' }
+    if ($allProcs) {
+      $target = @($allProcs)[0]
+      $shell.AppActivate($target.MainWindowTitle)
+      $found = $true
+    }
 
-    if ($procs -or $wt -or $ch) {
-      # Activate the window — try to find one with 'claude' in title
-      $found = $false
-      foreach ($p in @($procs, $wt, $ch)) {
-        if ($p) {
-          foreach ($proc in $p) {
-            if ($proc.MainWindowTitle -match 'claude') {
-              $shell.AppActivate($proc.MainWindowTitle)
-              $found = $true
-              break
-            }
-          }
-          if ($found) { break }
-        }
+    # Priority 2: WindowsTerminal
+    if (-not $found) {
+      $wt = Get-Process -Name WindowsTerminal -ErrorAction SilentlyContinue
+      if ($wt) {
+        $t = @($wt) | Where-Object { $_.MainWindowTitle -ne '' } | Select-Object -First 1
+        if ($t) { $shell.AppActivate($t.MainWindowTitle); $found = $true }
       }
+    }
 
-      if (-not $found) {
-        # Fallback: activate any cmd/terminal window
-        $shell.AppActivate('cmd')
-        Start-Sleep -Milliseconds 200
+    # Priority 3: cmd.exe
+    if (-not $found) {
+      $cmd = Get-Process -Name cmd -ErrorAction SilentlyContinue
+      if ($cmd) {
+        $t = @($cmd) | Where-Object { $_.MainWindowTitle -ne '' } | Select-Object -First 1
+        if ($t) { $shell.AppActivate($t.MainWindowTitle); $found = $true }
       }
+    }
 
+    # Priority 4: ConEmu, Cmder
+    if (-not $found) {
+      $alt = Get-Process -Name ConEmu64,ConEmu,Cmder -ErrorAction SilentlyContinue
+      if ($alt) {
+        $t = @($alt) | Where-Object { $_.MainWindowTitle -ne '' } | Select-Object -First 1
+        if ($t) { $shell.AppActivate($t.MainWindowTitle); $found = $true }
+      }
+    }
+
+    if ($found) {
       Start-Sleep -Milliseconds 300
-
-      # Paste from clipboard (Ctrl+V works in cmd on Windows 10+)
       $shell.SendKeys('^v')
       Start-Sleep -Milliseconds 200
       $shell.SendKeys('{ENTER}')
-
-      # Clear clipboard
       [System.Windows.Forms.Clipboard]::Clear()
-
-      Write-Output 'OK'
+      Write-Host 'OK'
     } else {
-      Write-Output 'NO_WINDOW'
+      [System.Windows.Forms.Clipboard]::Clear()
+      Write-Host 'NO_WINDOW'
     }
   `;
   fs.writeFileSync(tmpScript, psContent);
@@ -100,7 +97,8 @@ function injectWindows(text) {
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', tmpScript
     ], { timeout: 15000, encoding: 'utf8' }).trim();
     try { fs.unlinkSync(tmpScript); } catch {}
-    return result === 'OK';
+    log(`PowerShell result: ${result}`);
+    return result.includes('OK');
   } catch (e) {
     try { fs.unlinkSync(tmpScript); } catch {}
     log(`PowerShell injection failed: ${e.message}`);
@@ -108,29 +106,59 @@ function injectWindows(text) {
   }
 }
 
-// Unix: write directly to the TTY device
-function injectUnix(text) {
-  // Try tmux first (most reliable for detached processes)
+// ── macOS ────────────────────────────────────────────────────────────
+function injectMacOS(text) {
+  const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+  for (const app of ['Terminal', 'iTerm2', 'Warp', 'Alacritty', 'kitty']) {
+    try {
+      execSync(`osascript -e 'tell application "${app}" to activate'`, { timeout: 3000 });
+      break;
+    } catch {}
+  }
+
+  try {
+    execFileSync('osascript', ['-e',
+      `tell application "System Events" to keystroke "${escaped}"`
+    ], { timeout: 5000 });
+    execFileSync('osascript', ['-e',
+      'tell application "System Events" to keystroke return'
+    ], { timeout: 5000 });
+    return true;
+  } catch (e) {
+    log(`macOS osascript failed: ${e.message}`);
+    return false;
+  }
+}
+
+// ── Linux ────────────────────────────────────────────────────────────
+function injectLinux(text) {
+  // tmux
   try {
     execFileSync('tmux', ['send-keys', text, 'Enter'], { timeout: 5000 });
     return true;
   } catch {}
 
-  // macOS: use osascript to type into the active Terminal window
-  if (process.platform === 'darwin') {
-    try {
-      // Escape double quotes and backslashes for AppleScript string
-      const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-      const script = `tell application "System Events" to keystroke "${escaped}"`;
-      execFileSync('osascript', ['-e', script], { timeout: 5000 });
-      execFileSync('osascript', ['-e', 'tell application "System Events" to keystroke return'], { timeout: 5000 });
+  // xdotool (X11)
+  try {
+    const wid = execSync('xdotool search --onlyvisible --name claude 2>/dev/null', {
+      encoding: 'utf8', timeout: 3000
+    }).trim().split('\n')[0];
+    if (wid) {
+      execSync(`xdotool windowactivate ${wid} --sync type --delay 50 "${text}"`, { timeout: 5000 });
+      execSync('xdotool key Return', { timeout: 3000 });
       return true;
-    } catch (e) {
-      log(`macOS osascript failed: ${e.message}`);
     }
-  }
+  } catch {}
 
-  // Linux: try writing to /proc/self/fd/0
+  // ydotool (Wayland)
+  try {
+    execSync(`ydotool type "${text}"`, { timeout: 5000 });
+    execSync('ydotool key 28:1 28:0', { timeout: 3000 });
+    return true;
+  } catch {}
+
+  // /dev/pts fallback
   try {
     const fd0 = fs.readlinkSync('/proc/self/fd/0');
     if (fd0 && fd0.startsWith('/dev/pts/')) {
@@ -142,24 +170,21 @@ function injectUnix(text) {
   return false;
 }
 
+// ── Main ─────────────────────────────────────────────────────────────
 async function main() {
   log(`Waiting ${delay}s before injecting "${prompt}"...`);
   await sleep(delay * 1000);
 
-  log(`Injecting "${prompt}"...`);
+  log(`Injecting "${prompt}" on ${process.platform}...`);
 
   let success = false;
-  if (process.platform === 'win32') {
-    success = injectWindows(prompt);
-  } else {
-    success = injectUnix(prompt);
+  switch (process.platform) {
+    case 'win32': success = injectWindows(prompt); break;
+    case 'darwin': success = injectMacOS(prompt); break;
+    default: success = injectLinux(prompt); break;
   }
 
-  if (success) {
-    log('Injection successful');
-  } else {
-    log('Injection failed — could not find target terminal');
-  }
+  log(success ? 'Injection successful' : 'Injection failed');
 }
 
 main().catch(e => log(`Error: ${e.message}`));
